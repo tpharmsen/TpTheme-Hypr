@@ -4,6 +4,8 @@
 #include <QFile>
 #include <QRegularExpression>
 #include <QSysInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 
 namespace {
 QString firstLine(const QString &path)
@@ -19,6 +21,52 @@ WidgetBackend::WidgetBackend(QObject *parent) : QObject(parent)
 {
     connect(&m_timer, &QTimer::timeout, this, &WidgetBackend::refreshMetrics);
     m_timer.start(1000);
+    connect(&m_hyprctl, &QProcess::finished, this, [this] {
+        const QJsonObject data = QJsonDocument::fromJson(
+            m_hyprctl.readAllStandardOutput()).object();
+        const int workspace = data.value(QStringLiteral("id")).toInt();
+        if (workspace > 0 && workspace != m_activeWorkspace) {
+            m_activeWorkspace = workspace;
+            emit workspaceChanged();
+        }
+    });
+    connect(&m_nvidiaSmi, &QProcess::finished, this, [this](int exitCode) {
+        if (exitCode == 0) {
+            const QByteArray output = m_nvidiaSmi.readAllStandardOutput().trimmed();
+            bool ok = false;
+            const int utilization = output.split('\n').constFirst().trimmed().toInt(&ok);
+            if (ok)
+                m_gpu = qBound(0, utilization, 100);
+        } else {
+            const QString gpuBusy = firstLine(
+                QStringLiteral("/sys/class/drm/card0/device/gpu_busy_percent"));
+            if (!gpuBusy.isEmpty())
+                m_gpu = qBound(0, gpuBusy.toInt(), 100);
+        }
+        emit metricsChanged();
+    });
+    connect(&m_freeMemory, &QProcess::finished, this, [this](int exitCode) {
+        if (exitCode != 0)
+            return;
+        const QStringList lines = QString::fromUtf8(
+            m_freeMemory.readAllStandardOutput()).split('\n');
+        for (const QString &line : lines) {
+            const QString trimmed = line.trimmed();
+            if (!trimmed.startsWith(QLatin1String("Mem:")))
+                continue;
+            const QStringList fields = trimmed.split(
+                QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+            if (fields.size() < 3)
+                break;
+            const qlonglong total = fields.at(1).toLongLong();
+            const qlonglong used = fields.at(2).toLongLong();
+            if (total > 0) {
+                m_ram = qBound(0, int(used * 100 / total), 100);
+                emit metricsChanged();
+            }
+            break;
+        }
+    });
     refreshMetrics();
     refreshSpecs();
     refreshJournal();
@@ -26,6 +74,8 @@ WidgetBackend::WidgetBackend(QObject *parent) : QObject(parent)
 
 void WidgetBackend::refreshMetrics()
 {
+    if (m_hyprctl.state() == QProcess::NotRunning)
+        m_hyprctl.start(QStringLiteral("hyprctl"), {QStringLiteral("activeworkspace"), QStringLiteral("-j")});
     const QString stat = firstLine(QStringLiteral("/proc/stat"));
     static qlonglong previousIdle = 0;
     static qlonglong previousTotal = 0;
@@ -50,26 +100,96 @@ void WidgetBackend::refreshMetrics()
     qlonglong availableMem = 0;
     if (memFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
         while (!memFile.atEnd()) {
-            const QString line = QString::fromUtf8(memFile.readLine());
-            if (line.startsWith(QStringLiteral("MemTotal:")))
-                totalMem = line.section(' ', -2, -2).toLongLong();
-            else if (line.startsWith(QStringLiteral("MemAvailable:")))
-                availableMem = line.section(' ', -2, -2).toLongLong();
+            const QString line = QString::fromUtf8(memFile.readLine()).trimmed();
+            const QStringList fields = line.split(
+                QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+            if (fields.size() >= 2) {
+                if (fields.constFirst() == QLatin1String("MemTotal:"))
+                    totalMem = fields.at(1).toLongLong();
+                else if (fields.constFirst() == QLatin1String("MemAvailable:"))
+                    availableMem = fields.at(1).toLongLong();
+            }
         }
     }
     if (totalMem > 0)
         m_ram = qBound(0, int((totalMem - availableMem) * 100 / totalMem), 100);
+    if (m_freeMemory.state() == QProcess::NotRunning)
+        m_freeMemory.start(QStringLiteral("free"), {QStringLiteral("-b")});
 
-    const QString gpuBusy = firstLine(
-        QStringLiteral("/sys/class/drm/card0/device/gpu_busy_percent"));
-    if (!gpuBusy.isEmpty())
-        m_gpu = qBound(0, gpuBusy.toInt(), 100);
+    if (m_nvidiaSmi.state() == QProcess::NotRunning)
+        m_nvidiaSmi.start(
+            QStringLiteral("nvidia-smi"),
+            {QStringLiteral("--query-gpu=utilization.gpu"),
+             QStringLiteral("--format=csv,noheader,nounits")});
     const QString vramUsed = firstLine(
         QStringLiteral("/sys/class/drm/card0/device/mem_info_vram_used"));
     const QString vramTotal = firstLine(
         QStringLiteral("/sys/class/drm/card0/device/mem_info_vram_total"));
     if (!vramUsed.isEmpty() && !vramTotal.isEmpty() && vramTotal.toLongLong() > 0)
         m_vram = qBound(0, int(vramUsed.toLongLong() * 100 / vramTotal.toLongLong()), 100);
+
+    QString downloadInterface;
+    QFile routeFile(QStringLiteral("/proc/net/route"));
+    if (routeFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        routeFile.readLine();
+        while (!routeFile.atEnd()) {
+            const QString line = QString::fromUtf8(routeFile.readLine()).trimmed();
+            const QStringList fields = line.split(
+                QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+            if (fields.size() >= 4
+                && fields.at(1) == QLatin1String("00000000")) {
+                bool flagsOk = false;
+                const int flags = fields.at(3).toInt(&flagsOk, 16);
+                if (flagsOk && (flags & 1) != 0) {
+                    downloadInterface = fields.constFirst();
+                    break;
+                }
+            }
+        }
+    }
+    if (downloadInterface != m_downloadInterface) {
+        m_downloadInterface = downloadInterface;
+        m_previousReceivedBytes = 0;
+        m_smoothedDownloadKbps = 0.0;
+    }
+
+    quint64 receivedBytes = 0;
+    if (!downloadInterface.isEmpty()) {
+        QFile netFile(QStringLiteral("/proc/net/dev"));
+        if (netFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            while (!netFile.atEnd()) {
+                const QString line = QString::fromUtf8(netFile.readLine()).trimmed();
+                if (!line.contains(':'))
+                    continue;
+                const QString interfaceName = line.section(':', 0, 0).trimmed();
+                if (interfaceName != downloadInterface)
+                    continue;
+                const QStringList fields = line.section(':', 1).split(
+                    QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+                if (!fields.isEmpty())
+                    receivedBytes = fields.constFirst().toULongLong();
+                break;
+            }
+        }
+    }
+    if (m_previousReceivedBytes > 0 && receivedBytes >= m_previousReceivedBytes) {
+        const quint64 bytesPerSecond = receivedBytes - m_previousReceivedBytes;
+        const quint64 kilobitsPerSecond = bytesPerSecond * 8 / 1000;
+        const int instantKbps =
+            int(qMin<quint64>(kilobitsPerSecond, 2147483647ULL));
+        m_smoothedDownloadKbps = m_smoothedDownloadKbps > 0.0
+            ? (m_smoothedDownloadKbps * 0.7) + (instantKbps * 0.3)
+            : instantKbps;
+        m_downloadKbps = int(m_smoothedDownloadKbps);
+        m_downloadText = m_downloadKbps >= 1000
+            ? QStringLiteral("%1 Mbps").arg(m_downloadKbps / 1000.0, 0, 'f', 1)
+            : QStringLiteral("%1 kbps").arg(m_downloadKbps);
+    } else {
+        m_downloadKbps = 0;
+        m_downloadText = QStringLiteral("0 kbps");
+        m_smoothedDownloadKbps = 0.0;
+    }
+    m_previousReceivedBytes = receivedBytes;
 
     for (const QString &zone : QDir(QStringLiteral("/sys/class/thermal"))
              .entryList({QStringLiteral("thermal_zone*")}, QDir::Dirs | QDir::NoDotAndDotDot)) {
@@ -99,6 +219,15 @@ void WidgetBackend::refreshMetrics()
         }
     }
     emit metricsChanged();
+}
+
+void WidgetBackend::switchWorkspace(int workspace)
+{
+    if (workspace < 1 || workspace > 10)
+        return;
+    QProcess::startDetached(QStringLiteral("hyprctl"),
+                            {QStringLiteral("dispatch"), QStringLiteral("workspace"),
+                             QString::number(workspace)});
 }
 
 void WidgetBackend::refreshSpecs()

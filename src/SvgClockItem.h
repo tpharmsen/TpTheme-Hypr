@@ -3,6 +3,8 @@
 #include <QQuickPaintedItem>
 #include <QSvgRenderer>
 #include <QPixmap>
+#include <QTimer>
+#include <QElapsedTimer>
 
 class SvgClockItem : public QQuickPaintedItem {
     Q_OBJECT
@@ -26,4 +28,14 @@ private:
     HandAsset renderHand(const QString &id, qreal scale, qreal pivotY);
     QSvgRenderer m_renderer;
     QDateTime m_time;
+    qreal m_secondAngle = 180.0;
+    qreal m_cachedScale = 0.0;
+    QPixmap m_cachedFace;
+    HandAsset m_cachedSecondHand;
+    HandAsset m_cachedMinuteHand;
+    HandAsset m_cachedHourHand;
+    QTimer m_tickTimer;
+    qreal m_tickTargetAngle = 180.0;
+    qreal m_tickVelocity = 0.0;
+    QElapsedTimer m_tickElapsed;
 };

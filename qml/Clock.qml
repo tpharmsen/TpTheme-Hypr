@@ -9,7 +9,7 @@ WidgetWindow {
         anchors.margins: 20
     }
     Timer {
-        interval: 16
+        interval: 1000
         running: true
         repeat: true
         onTriggered: clock.time = new Date()
