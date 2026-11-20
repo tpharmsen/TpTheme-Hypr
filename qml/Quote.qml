@@ -4,6 +4,7 @@ WidgetWindow {
     id: root
     width: 560; height: 50
     property real scrollOffset: width
+    property real scrollSpeed: 8
     readonly property real windowScale:
         Math.max(0.25, height / 50)
 
@@ -17,7 +18,7 @@ WidgetWindow {
             id: textMetrics
             font.family: "monospace"
             font.bold: true
-            font.pixelSize: 13 * root.windowScale
+            font.pixelSize: 15 * root.windowScale
             text: "  " + backend.specs + "  "
         }
 
@@ -30,7 +31,7 @@ WidgetWindow {
             spacing: 26 * root.windowScale
 
             Repeater {
-                model: 12
+                model: Math.max(2, Math.ceil(viewport.width / viewport.segmentWidth) + 2)
                 delegate: Row {
                     required property int index
                     spacing: 26 * root.windowScale
@@ -56,11 +57,11 @@ WidgetWindow {
         }
 
         Timer {
-            interval: 16
-            running: true
+            interval: 200
+            running: root.visible && viewport.visible
             repeat: true
             onTriggered: {
-                scrollOffset -= root.windowScale
+                scrollOffset -= root.windowScale * root.scrollSpeed
                 if (scrollOffset <= -viewport.segmentWidth)
                     scrollOffset += viewport.segmentWidth
             }

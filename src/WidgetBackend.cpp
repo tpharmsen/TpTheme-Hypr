@@ -6,6 +6,7 @@
 #include <QSysInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QStorageInfo>
 
 namespace {
 QString firstLine(const QString &path)
@@ -15,6 +16,21 @@ QString firstLine(const QString &path)
         ? QString::fromUtf8(file.readLine()).trimmed()
         : QString();
 }
+
+QString uptimeText()
+{
+    const QString uptime = firstLine(QStringLiteral("/proc/uptime"));
+    const qlonglong totalMinutes = qlonglong(uptime.section(' ', 0, 0).toDouble()) / 60;
+    const qlonglong days = totalMinutes / 1440;
+    const qlonglong hours = (totalMinutes % 1440) / 60;
+    const qlonglong minutes = totalMinutes % 60;
+    if (days > 0)
+        return QStringLiteral("%1d %2h %3m").arg(days).arg(hours).arg(minutes);
+    if (hours > 0)
+        return QStringLiteral("%1h %2m").arg(hours).arg(minutes);
+    return QStringLiteral("%1m").arg(minutes);
+}
+
 }
 
 WidgetBackend::WidgetBackend(QObject *parent) : QObject(parent)
@@ -232,21 +248,27 @@ void WidgetBackend::switchWorkspace(int workspace)
 
 void WidgetBackend::refreshSpecs()
 {
-    QString os = QStringLiteral("Linux");
-    QFile release(QStringLiteral("/etc/os-release"));
-    if (release.open(QIODevice::ReadOnly | QIODevice::Text))
-        while (!release.atEnd()) {
-            const QString line = QString::fromUtf8(release.readLine()).trimmed();
-            if (line.startsWith(QStringLiteral("PRETTY_NAME="))) {
-                os = line.mid(12).remove('"');
-                break;
-            }
-        }
-    const QString cpu = firstLine(QStringLiteral("/proc/cpuinfo")).section(':', 1).trimmed();
-    m_specs = QStringLiteral("OS: %1     HOST: %2     KERNEL: %3     WM: Hyprland     "
-                             "THEME: TpTheme     CPU: %4     WAYLAND: native")
-        .arg(os, QSysInfo::machineHostName(), QSysInfo::kernelVersion(),
-             cpu.isEmpty() ? QStringLiteral("Unknown") : cpu);
+    QProcess fastfetch;
+    fastfetch.start(QStringLiteral("fastfetch"),
+                    {QStringLiteral("--pipe"), QStringLiteral("--logo"), QStringLiteral("none")});
+    if (!fastfetch.waitForStarted(1000) || !fastfetch.waitForFinished(3000)) {
+        m_specs = QStringLiteral("fastfetch unavailable");
+        emit specsChanged();
+        return;
+    }
+
+    QStringList fields;
+    for (const QString &line :
+         QString::fromUtf8(fastfetch.readAllStandardOutput()).split('\n')) {
+        const QString field = line.trimmed();
+        if (field.isEmpty() || field.contains(QRegularExpression(QStringLiteral("^[-]+$"))))
+            continue;
+        fields.append(field);
+    }
+
+    m_specs = fields.join(QStringLiteral("     "));
+    if (m_specs.isEmpty())
+        m_specs = QStringLiteral("No fastfetch system information available");
     emit specsChanged();
 }
 
